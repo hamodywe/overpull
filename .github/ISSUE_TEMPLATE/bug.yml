@@ -1,0 +1,56 @@
+name: Bug report
+description: overpull crashed, hung, or behaved unexpectedly
+title: "[bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For an incorrect analysis result, use the **Wrong verdict** template
+        instead — it asks the right questions.
+
+  - type: input
+    id: command
+    attributes:
+      label: Command
+      placeholder: overpull check --root . --json
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened
+      description: Output, error message, or backtrace (`RUST_BACKTRACE=1`).
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Smallest project that reproduces it
+      description: A file tree plus the relevant file contents is ideal.
+
+  - type: input
+    id: version
+    attributes:
+      label: overpull version
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: OS and Rust version
+      placeholder: "macOS 15 / rustc 1.85.0"
+    validations:
+      required: true

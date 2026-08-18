@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/hamodywe/overpull/security/advisories/new
+    about: Report privately through GitHub Security Advisories, not a public issue.
+  - name: Question or discussion
+    url: https://github.com/hamodywe/overpull/discussions
+    about: Usage questions and ideas that are not yet a request.

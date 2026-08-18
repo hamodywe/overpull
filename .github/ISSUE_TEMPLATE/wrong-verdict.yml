@@ -1,0 +1,65 @@
+name: Wrong verdict
+description: overpull reported something that is not true
+title: "[wrong verdict] "
+labels: [bug, correctness]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is the highest-priority bug class in this project. A false
+        `crash` verdict costs more trust than a missed finding, because it
+        teaches people to ignore the report.
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What kind of error?
+      options:
+        - False positive — reported something that is fine
+        - False negative — missed something that is broken
+        - Wrong severity — right finding, wrong verdict
+        - Wrong evidence — right verdict, wrong line/binding/module
+    validations:
+      required: true
+
+  - type: input
+    id: command
+    attributes:
+      label: Command
+      placeholder: overpull cycles --root packages/app --fail-on crash
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: What overpull said
+      description: Paste the output. `--json` is even better.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: truth
+    attributes:
+      label: What is actually true, and how you know
+      description: >
+        The code that was misread, ideally reduced. If you are reporting a
+        false crash, what shows that it does not crash — the app runs, a
+        test passes, Node loads it?
+    validations:
+      required: true
+
+  - type: input
+    id: repo
+    attributes:
+      label: Public repository and commit, if you can share one
+      placeholder: https://github.com/org/repo @ abc1234
+
+  - type: input
+    id: version
+    attributes:
+      label: overpull version
+      placeholder: "0.1.0 (overpull --version)"
+    validations:
+      required: true

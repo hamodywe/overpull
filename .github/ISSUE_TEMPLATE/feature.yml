@@ -1,0 +1,34 @@
+name: Feature request
+description: Suggest something overpull should be able to answer
+title: "[feature] "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check [ROADMAP.md](../../blob/main/ROADMAP.md) first — it lists what
+        is planned and what is deliberately out of scope, with reasons.
+
+  - type: textarea
+    id: question
+    attributes:
+      label: What question would this answer?
+      description: >
+        Describe the situation you are in when you would reach for it, not
+        the feature. "I need to know which import made the test suite slow"
+        is more useful than "add a --slow flag".
+    validations:
+      required: true
+
+  - type: textarea
+    id: today
+    attributes:
+      label: How do you answer it today?
+      description: Another tool, a script, reading the code by hand?
+
+  - type: textarea
+    id: shape
+    attributes:
+      label: What the output might look like
+      description: A sketch of the command and its report, if you have one.
+      render: text
