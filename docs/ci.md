@@ -71,8 +71,21 @@ in about two seconds with zero steps executed and one annotation:
 
 That lock is account-wide. It applies to public repositories even though
 Actions minutes are free for them, and no change to the workflow files can
-work around it. It clears when the billing issue on the account is settled;
-the workflows are correct and will run as written when it does.
+work around it. It clears when the billing issue on the account is settled.
+
+**One line in `ci.yml` is stale and cannot be pushed from here.** The `msrv`
+job still pins `dtolnay/rust-toolchain@1.85.0`, while the real minimum is
+1.95 (see the 0.2.0 changelog). Updating a workflow file needs a token with
+the `workflow` scope, which the token in use does not have, so the fix has to
+be applied either by granting that scope or by editing the line directly on
+GitHub:
+
+```yaml
+      - uses: dtolnay/rust-toolchain@1.95.0
+```
+
+Until then the `msrv` job would fail if it ran. `.cirrus.yml` and
+`scripts/ci.sh` already use 1.95, so both are correct.
 
 ## 3. Cirrus CI — `.cirrus.yml`
 
