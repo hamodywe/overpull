@@ -51,6 +51,6 @@ body:
     id: platform
     attributes:
       label: OS and Rust version
-      placeholder: "macOS 15 / rustc 1.85.0"
+      placeholder: "macOS 15 / rustc 1.95.0"
     validations:
       required: true

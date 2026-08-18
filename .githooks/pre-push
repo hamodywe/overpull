@@ -1,0 +1,9 @@
+#!/usr/bin/env sh
+# Runs the checks CI would run, before anything leaves the machine.
+#
+# Enable with: sh scripts/install-hooks.sh
+# Bypass once with: git push --no-verify
+#
+# Deliberately the quick set — fmt, clippy, tests. The fixture and dogfood
+# stages take a release build and belong in `sh scripts/ci.sh`.
+exec sh "$(git rev-parse --show-toplevel)/scripts/ci.sh" --quick

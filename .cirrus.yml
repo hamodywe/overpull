@@ -1,0 +1,64 @@
+# Cirrus CI — the same checks as .github/workflows/ci.yml, on a provider that
+# does not draw on GitHub Actions minutes.
+#
+# Why this file exists: GitHub Actions is disabled account-wide when a billing
+# issue locks the account, and that lock applies to public repositories too.
+# Nothing in the code can fix that, so the checks live somewhere that does not
+# depend on it. See docs/ci.md.
+#
+# To enable: install the Cirrus CI GitHub App on this repository. It is free
+# for public repositories on the community Linux cluster. Nothing else is
+# needed — this file is the whole configuration.
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  CARGO_HOME: /root/.cargo
+
+lint_and_test_task:
+  name: fmt + clippy + test
+  container:
+    image: rust:latest
+    cpu: 4
+    memory: 8G
+  registry_cache:
+    folder: $CARGO_HOME/registry
+    fingerprint_script: cat Cargo.lock
+  target_cache:
+    folder: target
+    fingerprint_script: echo $CIRRUS_OS && cat Cargo.lock
+  components_script: rustup component add rustfmt clippy
+  fmt_script: cargo fmt --all --check
+  clippy_script: cargo clippy --all-targets
+  test_script: cargo test --all-targets
+  before_cache_script: rm -rf $CARGO_HOME/registry/index
+
+# Builds on the version `rust-version` claims, so the claim is tested rather
+# than asserted.
+msrv_task:
+  name: minimum supported rust version
+  container:
+    image: rust:1.95
+    cpu: 2
+    memory: 4G
+  registry_cache:
+    folder: $CARGO_HOME/registry
+    fingerprint_script: cat Cargo.lock
+  build_script: cargo build
+
+# The crash fixtures must actually crash in Node and the benign ones must
+# actually run. Without this, a "crash" verdict is an assertion agreeing with
+# itself.
+fixtures_task:
+  name: fixtures behave as documented
+  container:
+    image: rust:latest
+    cpu: 4
+    memory: 8G
+  registry_cache:
+    folder: $CARGO_HOME/registry
+    fingerprint_script: cat Cargo.lock
+  node_script: |
+    curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
+    apt-get install -y nodejs
+  script: sh scripts/ci.sh
