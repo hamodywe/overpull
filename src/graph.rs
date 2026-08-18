@@ -293,6 +293,87 @@ impl ModuleGraph {
         None
     }
 
+    /// Every runtime export this module offers, resolved to the module that
+    /// declares it and its declaration kind.
+    ///
+    /// Used when a namespace object is read as a whole (`{...ns}`,
+    /// `console.log(ns)`, a computed key): that observes every export at
+    /// once, so every export is a candidate for a temporal-dead-zone read.
+    pub fn runtime_exports(&self, module: usize) -> Vec<(String, usize, DeclKind)> {
+        let mut names: BTreeSet<String> = BTreeSet::new();
+        let mut seen: HashSet<usize> = HashSet::new();
+        self.collect_export_names(module, &mut names, &mut seen, 0);
+        names
+            .into_iter()
+            .filter_map(|name| {
+                self.resolve_export(module, &name)
+                    .map(|(owner, kind)| (name, owner, kind))
+            })
+            .collect()
+    }
+
+    fn collect_export_names(
+        &self,
+        module: usize,
+        out: &mut BTreeSet<String>,
+        seen: &mut HashSet<usize>,
+        depth: usize,
+    ) {
+        if depth > MAX_REEXPORT_DEPTH || !seen.insert(module) {
+            return;
+        }
+        let facts = &self.modules[module].facts;
+        out.extend(facts.export_decl_kinds.keys().cloned());
+        for reexport in &facts.named_reexports {
+            if !reexport.is_type {
+                out.insert(reexport.export_name.clone());
+            }
+        }
+        for star in &facts.star_reexports {
+            if star.is_type {
+                continue;
+            }
+            if let Some(target) = self.edge_target(module, &star.specifier) {
+                self.collect_export_names(target, out, seen, depth + 1);
+            }
+        }
+    }
+
+    /// Shortest chain of runtime imports from `from` to `to`, inclusive.
+    ///
+    /// `scope`, when given, restricts the walk to a set of modules — a cycle
+    /// analysis asks about paths inside one component, `overpull why` asks
+    /// about the whole graph.
+    pub fn shortest_import_path(
+        &self,
+        from: usize,
+        to: usize,
+        scope: Option<&HashSet<usize>>,
+    ) -> Option<Vec<usize>> {
+        let mut previous: HashMap<usize, usize> = HashMap::new();
+        let mut queue: VecDeque<usize> = VecDeque::from([from]);
+        let mut seen: HashSet<usize> = HashSet::from([from]);
+        while let Some(current) = queue.pop_front() {
+            if current == to {
+                let mut path = vec![to];
+                let mut node = to;
+                while node != from {
+                    node = previous[&node];
+                    path.push(node);
+                }
+                path.reverse();
+                return Some(path);
+            }
+            for edge in &self.modules[current].edges {
+                if scope.is_none_or(|set| set.contains(&edge.to)) && seen.insert(edge.to) {
+                    previous.insert(edge.to, current);
+                    queue.push_back(edge.to);
+                }
+            }
+        }
+        None
+    }
+
     fn edge_target(&self, module: usize, specifier: &str) -> Option<usize> {
         self.modules[module]
             .edges

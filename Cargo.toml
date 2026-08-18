@@ -1,8 +1,8 @@
 [package]
 name = "overpull"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.95"
 description = "Measures what your imports really load: module-graph cost, barrel-file amplification, and the import cycles that compile clean and crash at runtime."
 license = "MIT"
 repository = "https://github.com/hamodywe/overpull"
@@ -11,7 +11,7 @@ documentation = "https://github.com/hamodywe/overpull#readme"
 readme = "README.md"
 keywords = ["typescript", "import-graph", "barrel-files", "circular-dependency", "cli"]
 categories = ["command-line-utilities", "development-tools"]
-exclude = ["/.github", "/docs", "/examples", "/tests/fixtures"]
+exclude = ["/.github", "/docs", "/examples", "/tests/fixtures", "/.githooks", "/scripts", "/.cirrus.yml"]
 
 [dependencies]
 oxc_allocator = "0.144.0"

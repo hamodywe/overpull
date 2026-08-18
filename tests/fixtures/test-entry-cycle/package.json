@@ -1,0 +1,6 @@
+{
+  "name": "test-entry-cycle-fixture",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.mjs" }
+}

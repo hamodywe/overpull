@@ -1,0 +1,9 @@
+{
+  "name": "entry-points-fixture",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": { "import": "./src/index.ts" }
+  },
+  "bin": { "tool": "./src/cli.ts" }
+}

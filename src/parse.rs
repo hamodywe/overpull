@@ -12,6 +12,7 @@ use oxc_allocator::Allocator;
 use oxc_ast::AstKind;
 use oxc_ast::ast::{Argument, ExportDefaultDeclarationKind, Expression, TSModuleReference};
 use oxc_parser::Parser;
+use oxc_semantic::AstNode;
 use oxc_semantic::{Semantic, SemanticBuilder};
 use oxc_span::{GetSpan, SourceType, Span};
 use oxc_syntax::module_record::{
@@ -21,7 +22,7 @@ use oxc_syntax::symbol::SymbolFlags;
 
 use crate::model::{
     BindingFact, DeclKind, DynamicImportFact, FileFacts, ImportEdgeFact, ImportedName,
-    NamedReExport, ReExportSource, RequireFact, StarReExport, Usage,
+    NamedReExport, NamespaceReads, ReExportSource, RequireFact, StarReExport, Usage,
 };
 use crate::util::LineIndex;
 
@@ -110,10 +111,10 @@ fn collect_import_edges(
         .iter()
         .chain(&record.star_export_entries)
     {
-        if let Some(request) = &entry.module_request {
-            if !entry.is_type {
-                runtime_reexport_specs.insert(request.name.to_string());
-            }
+        if let Some(request) = &entry.module_request
+            && !entry.is_type
+        {
+            runtime_reexport_specs.insert(request.name.to_string());
         }
     }
 
@@ -151,7 +152,8 @@ fn collect_import_edges(
             ImportImportName::NamespaceObject => ImportedName::Namespace,
         };
         let local = entry.local_name.name.to_string();
-        let usage = classify_usage(semantic, &local, entry.local_name.span, lines);
+        let is_namespace = imported == ImportedName::Namespace;
+        let facts = classify_usage(semantic, &local, entry.local_name.span, is_namespace, lines);
         let accum = by_spec.entry(spec).or_insert(Accum {
             line: lines.line(entry.statement_span.start),
             side_effect: false,
@@ -162,7 +164,8 @@ fn collect_import_edges(
             local,
             imported,
             line: lines.line(entry.local_name.span.start),
-            usage,
+            usage: facts.usage,
+            namespace_reads: facts.namespace_reads,
         });
     }
 
@@ -184,26 +187,43 @@ fn collect_import_edges(
     edges
 }
 
+/// What one imported binding's references say about evaluation time.
+struct UsageFacts {
+    usage: Usage,
+    namespace_reads: NamespaceReads,
+}
+
 /// Classifies how an imported binding is used relative to module evaluation:
 /// a reference inside a function body waits until the function is called; a
-/// reference in a top-level statement, an `extends` clause, a decorator, or a
-/// static class member runs while the module itself evaluates.
+/// reference in a top-level statement, an `extends` clause, a decorator, a
+/// static class member, or an immediately-invoked function expression runs
+/// while the module itself evaluates.
+///
+/// For a namespace binding it also records which members are touched. Holding
+/// a namespace object is always safe — the object exists from instantiation —
+/// so only a member read can throw, and only when that member is in the
+/// temporal dead zone.
 fn classify_usage(
     semantic: &Semantic,
     local_name: &str,
     binding_span: Span,
+    is_namespace: bool,
     lines: &LineIndex,
-) -> Usage {
+) -> UsageFacts {
     let scoping = semantic.scoping();
     let Some(symbol_id) = scoping.symbol_ids().find(|id| {
         scoping.symbol_span(*id) == binding_span && scoping.symbol_name(*id) == local_name
     }) else {
-        return Usage::Unused;
+        return UsageFacts {
+            usage: Usage::Unused,
+            namespace_reads: NamespaceReads::default(),
+        };
     };
 
     let mut saw_type = false;
     let mut saw_deferred = false;
     let mut immediate: Option<(u32, bool)> = None;
+    let mut namespace_reads = NamespaceReads::default();
 
     for &reference_id in scoping.get_resolved_reference_ids(symbol_id) {
         let reference = scoping.get_reference(reference_id);
@@ -213,52 +233,26 @@ fn classify_usage(
         }
         let node_id = reference.node_id();
         let ref_span = semantic.nodes().get_node(node_id).kind().span();
-        let mut in_extends = false;
-        let mut deferred = false;
-        for ancestor in semantic.nodes().ancestors(node_id) {
-            match ancestor.kind() {
-                AstKind::Function(_) | AstKind::ArrowFunctionExpression(_) => {
-                    deferred = true;
-                    break;
-                }
-                AstKind::PropertyDefinition(prop) if !prop.r#static => {
-                    // An instance-property initializer runs at construction,
-                    // not at class evaluation. The key side still evaluates
-                    // immediately (computed keys), so only the value defers.
-                    if let Some(value) = &prop.value {
-                        let vs = value.span();
-                        if vs.start <= ref_span.start && ref_span.end <= vs.end {
-                            deferred = true;
-                            break;
-                        }
-                    }
-                }
-                AstKind::Class(class) => {
-                    if let Some(heritage) = &class.heritage {
-                        let hs = heritage.expression.span();
-                        if hs.start <= ref_span.start && ref_span.end <= hs.end {
-                            in_extends = true;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
+        let ancestors: Vec<&AstNode> = semantic.nodes().ancestors(node_id).collect();
+        let (deferred, in_extends) = evaluation_context(&ancestors, ref_span);
         if deferred {
             saw_deferred = true;
-        } else {
-            let line = lines.line(ref_span.start);
-            match immediate {
-                // Prefer reporting an `extends` read: it is the clearest crash.
-                Some((_, true)) => {}
-                Some(_) if in_extends => immediate = Some((line, true)),
-                Some(_) => {}
-                None => immediate = Some((line, in_extends)),
-            }
+            continue;
+        }
+        if is_namespace {
+            record_namespace_read(&ancestors, ref_span, &mut namespace_reads);
+        }
+        let line = lines.line(ref_span.start);
+        match immediate {
+            // Prefer reporting an `extends` read: it is the clearest crash.
+            Some((_, true)) => {}
+            Some(_) if in_extends => immediate = Some((line, true)),
+            Some(_) => {}
+            None => immediate = Some((line, in_extends)),
         }
     }
 
-    if let Some((line, in_extends)) = immediate {
+    let usage = if let Some((line, in_extends)) = immediate {
         Usage::Immediate { line, in_extends }
     } else if saw_deferred {
         Usage::Deferred
@@ -266,6 +260,134 @@ fn classify_usage(
         Usage::TypeOnly
     } else {
         Usage::Unused
+    };
+    UsageFacts {
+        usage,
+        namespace_reads,
+    }
+}
+
+/// Walks the ancestor chain of one reference: does it run while the module
+/// evaluates, and does it sit in a class `extends` clause?
+fn evaluation_context(ancestors: &[&AstNode], ref_span: Span) -> (bool, bool) {
+    let mut in_extends = false;
+    let mut i = 0usize;
+    while i < ancestors.len() {
+        match ancestors[i].kind() {
+            AstKind::Function(function) => {
+                match immediately_invoked(
+                    ancestors,
+                    i,
+                    function.span,
+                    function.r#async || function.generator,
+                ) {
+                    // An IIFE runs where it is written, so the walk continues
+                    // from the call site rather than stopping here.
+                    Some(next) => {
+                        i = next;
+                        continue;
+                    }
+                    None => return (true, in_extends),
+                }
+            }
+            AstKind::ArrowFunctionExpression(arrow) => {
+                match immediately_invoked(ancestors, i, arrow.span, arrow.r#async) {
+                    Some(next) => {
+                        i = next;
+                        continue;
+                    }
+                    None => return (true, in_extends),
+                }
+            }
+            AstKind::PropertyDefinition(prop) if !prop.r#static => {
+                // An instance-property initializer runs at construction, not
+                // at class evaluation. The key side still evaluates
+                // immediately (computed keys), so only the value defers.
+                if let Some(value) = &prop.value
+                    && covers(value.span(), ref_span)
+                {
+                    return (true, in_extends);
+                }
+            }
+            AstKind::Class(class) => {
+                if let Some(heritage) = &class.heritage
+                    && covers(heritage.expression.span(), ref_span)
+                {
+                    in_extends = true;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    (false, in_extends)
+}
+
+/// If the function at `index` is called where it stands — `(f)()`,
+/// `(f).call(this)`, `new (f)()` — returns the ancestor index of the call so
+/// the walk continues from the call site.
+///
+/// Async and generator functions stay deferred: only the part before the
+/// first `await`/`yield` runs synchronously, and overpull does not report
+/// what it cannot prove.
+fn immediately_invoked(
+    ancestors: &[&AstNode],
+    index: usize,
+    fn_span: Span,
+    suspends: bool,
+) -> Option<usize> {
+    if suspends {
+        return None;
+    }
+    let call = skip_parens(ancestors, index + 1)?;
+    match ancestors.get(call)?.kind() {
+        AstKind::CallExpression(expr) if covers(expr.callee.span(), fn_span) => Some(call),
+        AstKind::NewExpression(expr) if covers(expr.callee.span(), fn_span) => Some(call),
+        // `(function () { … }).call(this)` — the member expression is the
+        // callee of the call one level further up.
+        AstKind::StaticMemberExpression(member)
+            if covers(member.object.span(), fn_span)
+                && matches!(member.property.name.as_str(), "call" | "apply") =>
+        {
+            let outer = skip_parens(ancestors, call + 1)?;
+            match ancestors.get(outer)?.kind() {
+                AstKind::CallExpression(expr) if covers(expr.callee.span(), member.span) => {
+                    Some(outer)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// First ancestor index at or after `from` that is not a parenthesis node.
+/// The parser preserves parentheses, and every IIFE has them.
+fn skip_parens(ancestors: &[&AstNode], from: usize) -> Option<usize> {
+    let mut i = from;
+    while matches!(
+        ancestors.get(i)?.kind(),
+        AstKind::ParenthesizedExpression(_)
+    ) {
+        i += 1;
+    }
+    Some(i)
+}
+
+fn covers(outer: Span, inner: Span) -> bool {
+    outer.start <= inner.start && inner.end <= outer.end
+}
+
+/// Records what one evaluation-time reference to a namespace binding reads:
+/// a named member, or the whole object.
+fn record_namespace_read(ancestors: &[&AstNode], ref_span: Span, reads: &mut NamespaceReads) {
+    match ancestors.first().map(|node| node.kind()) {
+        Some(AstKind::StaticMemberExpression(member)) if covers(member.object.span(), ref_span) => {
+            reads.members.push(member.property.name.to_string());
+        }
+        // A computed key, a spread, a call argument, a `console.log`: any of
+        // these can observe every export at once.
+        _ => reads.whole_object = true,
     }
 }
 

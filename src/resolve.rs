@@ -107,10 +107,10 @@ impl SpecResolver {
 pub fn package_name(specifier: &str) -> String {
     let mut parts = specifier.split('/');
     let first = parts.next().unwrap_or(specifier);
-    if first.starts_with('@') {
-        if let Some(second) = parts.next() {
-            return format!("{first}/{second}");
-        }
+    if first.starts_with('@')
+        && let Some(second) = parts.next()
+    {
+        return format!("{first}/{second}");
     }
     first.to_string()
 }

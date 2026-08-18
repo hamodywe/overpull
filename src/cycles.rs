@@ -16,13 +16,17 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::entries::{Entry, EntryKind};
 use crate::graph::{EdgeKind, ModuleGraph, strongly_connected_components};
-use crate::model::{DeclKind, Usage};
+use crate::model::{BindingFact, DeclKind, ImportedName, Usage};
 
-/// How many entry points are simulated per class. Orders repeat quickly;
-/// this bounds work on pathological graphs without losing findings in
-/// practice.
-const MAX_ENTRIES_SIMULATED: usize = 8;
+/// How many entry points are simulated as real program starts. Orders repeat
+/// quickly, so this bounds work on pathological graphs; when it bites, the
+/// report says so rather than quietly downgrading what it did not check.
+const MAX_ENTRIES_SIMULATED: usize = 64;
+
+/// How many of a component's own members are simulated as "loaded first".
+const MAX_MEMBERS_SIMULATED: usize = 8;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Hazard {
@@ -66,14 +70,18 @@ pub struct HazardDetail {
     pub reader: usize,
     pub read_line: u32,
     pub binding_local: String,
+    /// Member read off a namespace binding, when the import was
+    /// `import * as ns` and the read was `ns.member`.
+    pub member: Option<String>,
     pub imported_name: String,
     /// Module that declares the binding (after following re-exports).
     pub owner: usize,
     pub decl_kind: DeclKind,
     /// The direct import target (differs from `owner` through a barrel).
     pub via: usize,
-    /// Component entry whose evaluation order produces the failure.
+    /// Entry point whose evaluation order produces the failure.
     pub entry: usize,
+    pub entry_kind: EntryKind,
     pub in_extends: bool,
 }
 
@@ -95,29 +103,61 @@ pub struct CycleFinding {
     pub suggestion: Option<BreakSuggestion>,
 }
 
-pub fn analyze(graph: &ModuleGraph) -> Vec<CycleFinding> {
-    // Real entry points first: a module nothing imports is where the project
-    // actually starts, and the order it produces decides whether a cycle is a
-    // live bug or a trap waiting for someone to deep-import into it.
-    // Computed once and shared by every component.
-    let root_orders: Vec<RootOrder> = (0..graph.modules.len())
-        .filter(|&i| graph.importers[i].is_empty())
+/// Findings plus what the simulation did and did not cover.
+pub struct CycleAnalysis {
+    pub findings: Vec<CycleFinding>,
+    /// Entry points simulated as real program starts.
+    pub entries_simulated: usize,
+    /// Real entry points the cap left out. A hazard reachable only through
+    /// one of these is reported one level down, so saying the number out loud
+    /// is the difference between a bound and a silent hole.
+    pub entries_skipped: usize,
+    /// How many of those were declared program entry points rather than test
+    /// files — the only kind whose absence can turn a `crash` into a
+    /// `crash-if-loaded-first`.
+    pub entries_skipped_declared: usize,
+}
+
+pub fn analyze(graph: &ModuleGraph, entries: &[Entry]) -> CycleAnalysis {
+    // Real entry points first: what the project itself loads decides whether
+    // a cycle is a live bug or a trap waiting for someone to deep-import into
+    // it. Computed once and shared by every component.
+    let simulated: Vec<&Entry> = entries.iter().filter(|e| e.kind.is_simulated()).collect();
+    let entries_skipped = simulated.len().saturating_sub(MAX_ENTRIES_SIMULATED);
+    // Declared entries sort first, so any skipped means the cap ate a real
+    // program start — the only case that can downgrade a `crash`.
+    let entries_skipped_declared = simulated
+        .iter()
+        .skip(MAX_ENTRIES_SIMULATED)
+        .filter(|e| e.kind.is_real_start())
+        .count();
+    let root_orders: Vec<RootOrder> = simulated
+        .iter()
         .take(MAX_ENTRIES_SIMULATED)
         .map(|entry| RootOrder {
-            entry,
-            order: evaluation_order(graph, entry, None),
+            entry: entry.module,
+            kind: entry.kind,
+            order: evaluation_order(graph, entry.module, None),
         })
         .collect();
 
-    strongly_connected_components(graph)
+    let findings = strongly_connected_components(graph)
         .into_iter()
         .map(|members| analyze_component(graph, members, &root_orders))
-        .collect()
+        .collect();
+
+    CycleAnalysis {
+        findings,
+        entries_simulated: root_orders.len(),
+        entries_skipped,
+        entries_skipped_declared,
+    }
 }
 
 /// One project entry point and the module evaluation order it produces.
 struct RootOrder {
     entry: usize,
+    kind: EntryKind,
     /// Module → position, 0 = evaluated first.
     order: HashMap<usize, usize>,
 }
@@ -127,6 +167,76 @@ struct ScanState {
     detail: Option<HazardDetail>,
 }
 
+/// One declaration an early read can land on, named as the report will name
+/// it.
+struct Candidate {
+    /// `Some` when the read went through a namespace member.
+    member: Option<String>,
+    name: String,
+    owner: usize,
+    kind: DeclKind,
+}
+
+/// The declarations one binding's evaluation-time read can touch.
+///
+/// For a plain binding that is the single export it names. For a namespace
+/// binding it is every member actually read: the namespace object exists from
+/// instantiation, so holding it never throws, and `ns.someHoistedFunction()`
+/// is legal in a cycle no matter what order the modules run in.
+fn read_candidates(graph: &ModuleGraph, target: usize, binding: &BindingFact) -> Vec<Candidate> {
+    if !matches!(binding.imported, ImportedName::Namespace) {
+        let name = binding.imported.display();
+        return graph
+            .resolve_export(target, &name)
+            .map(|(owner, kind)| Candidate {
+                member: None,
+                name,
+                owner,
+                kind,
+            })
+            .into_iter()
+            .collect();
+    }
+
+    let mut candidates: Vec<Candidate> = binding
+        .namespace_reads
+        .members
+        .iter()
+        .filter_map(|member| {
+            graph
+                .resolve_export(target, member)
+                .map(|(owner, kind)| Candidate {
+                    member: Some(member.clone()),
+                    name: member.clone(),
+                    owner,
+                    kind,
+                })
+        })
+        .collect();
+
+    if binding.namespace_reads.whole_object {
+        // Spread, logged, or indexed with a computed key: that can observe
+        // every export at once, so every export is a candidate.
+        let exports = graph.runtime_exports(target);
+        if exports.is_empty() {
+            candidates.push(Candidate {
+                member: None,
+                name: "*".to_string(),
+                owner: target,
+                kind: DeclKind::ConstLet,
+            });
+        } else {
+            candidates.extend(exports.into_iter().map(|(name, owner, kind)| Candidate {
+                member: Some(name.clone()),
+                name,
+                owner,
+                kind,
+            }));
+        }
+    }
+    candidates
+}
+
 /// Checks one evaluation order for bindings read before the module that
 /// declares them has run, keeping the worst hazard seen so far.
 fn scan_order(
@@ -134,10 +244,11 @@ fn scan_order(
     members: &[usize],
     member_set: &HashSet<usize>,
     entry: usize,
+    entry_kind: EntryKind,
     order: &HashMap<usize, usize>,
-    conditional: bool,
     state: &mut ScanState,
 ) {
+    let conditional = !entry_kind.is_real_start();
     for &module in members {
         let Some(&module_pos) = order.get(&module) else {
             continue;
@@ -159,54 +270,46 @@ fn scan_order(
                 let Usage::Immediate { line, in_extends } = binding.usage else {
                     continue;
                 };
-                let name = binding.imported.display();
-                let resolved = if name == "*" {
-                    // A namespace object read at top level observes the
-                    // uninitialized namespace: property reads throw for TDZ
-                    // bindings. Treat as const-like on the target.
-                    Some((edge.to, DeclKind::ConstLet))
-                } else {
-                    graph.resolve_export(edge.to, &name)
-                };
-                let Some((owner, kind)) = resolved else {
-                    continue;
-                };
-                // The owner itself must still be un-evaluated at read time;
-                // through a re-export chain it may already have run.
-                if owner != edge.to {
-                    match order.get(&owner) {
-                        Some(&p) if p > module_pos => {}
-                        _ => continue,
-                    }
-                }
-                let hazard = match kind {
-                    DeclKind::ConstLet | DeclKind::Class => {
-                        if conditional {
-                            Hazard::ConditionalCrash
-                        } else {
-                            Hazard::Crash
+                for candidate in read_candidates(graph, edge.to, binding) {
+                    // The owner itself must still be un-evaluated at read
+                    // time; through a re-export chain it may already have run.
+                    if candidate.owner != edge.to {
+                        match order.get(&candidate.owner) {
+                            Some(&position) if position > module_pos => {}
+                            _ => continue,
                         }
                     }
-                    DeclKind::VarLike | DeclKind::Unknown => Hazard::Undefined,
-                    DeclKind::HoistedFunction | DeclKind::TypeOnly => continue,
-                };
-                let better = hazard > state.worst
-                    || (hazard == state.worst
-                        && in_extends
-                        && state.detail.as_ref().is_some_and(|d| !d.in_extends));
-                if better {
-                    state.worst = hazard;
-                    state.detail = Some(HazardDetail {
-                        reader: module,
-                        read_line: line,
-                        binding_local: binding.local.clone(),
-                        imported_name: name,
-                        owner,
-                        decl_kind: kind,
-                        via: edge.to,
-                        entry,
-                        in_extends,
-                    });
+                    let hazard = match candidate.kind {
+                        DeclKind::ConstLet | DeclKind::Class => {
+                            if conditional {
+                                Hazard::ConditionalCrash
+                            } else {
+                                Hazard::Crash
+                            }
+                        }
+                        DeclKind::VarLike | DeclKind::Unknown => Hazard::Undefined,
+                        DeclKind::HoistedFunction | DeclKind::TypeOnly => continue,
+                    };
+                    let better = hazard > state.worst
+                        || (hazard == state.worst
+                            && in_extends
+                            && state.detail.as_ref().is_some_and(|d| !d.in_extends));
+                    if better {
+                        state.worst = hazard;
+                        state.detail = Some(HazardDetail {
+                            reader: module,
+                            read_line: line,
+                            binding_local: binding.local.clone(),
+                            member: candidate.member,
+                            imported_name: candidate.name,
+                            owner: candidate.owner,
+                            decl_kind: candidate.kind,
+                            via: edge.to,
+                            entry,
+                            entry_kind,
+                            in_extends,
+                        });
+                    }
                 }
             }
         }
@@ -232,33 +335,34 @@ fn analyze_component(
         detail: None,
     };
 
-    // Pass one: the evaluation orders the project's own entry points
-    // produce. A hazard found here fires by simply starting the app.
+    // Pass one: the evaluation orders the project's own entry points and test
+    // files produce. A hazard found here fires by starting the app or running
+    // the suite.
     for root in root_orders {
         scan_order(
             graph,
             &members,
             &member_set,
             root.entry,
+            root.kind,
             &root.order,
-            false,
             &mut state,
         );
     }
 
-    // Pass two: each member as if it were loaded first — a deep import, or a
-    // test file importing an internal module directly. Real, but conditional
-    // on entry order, so it is reported one level down. Calling this a crash
-    // would mean calling working code broken.
-    for &entry in members.iter().take(MAX_ENTRIES_SIMULATED) {
+    // Pass two: each member as if it were loaded first — a deep import from
+    // somewhere the entry set does not cover. Real, but conditional on entry
+    // order, so it is reported one level down. Calling this a crash would
+    // mean calling working code broken.
+    for &entry in members.iter().take(MAX_MEMBERS_SIMULATED) {
         let order = evaluation_order(graph, entry, Some(&member_set));
         scan_order(
             graph,
             &members,
             &member_set,
             entry,
+            EntryKind::Orphan,
             &order,
-            true,
             &mut state,
         );
     }
@@ -337,7 +441,9 @@ fn cycle_through_edge(
     from: usize,
     to: usize,
 ) -> Vec<usize> {
-    let path = shortest_path(graph, members, to, from).unwrap_or_else(|| vec![to, from]);
+    let path = graph
+        .shortest_import_path(to, from, Some(members))
+        .unwrap_or_else(|| vec![to, from]);
     let mut cycle = vec![from];
     cycle.extend(path);
     cycle
@@ -353,7 +459,7 @@ fn shortest_cycle(graph: &ModuleGraph, members: &HashSet<usize>, start: usize) -
         if edge.to == start {
             return vec![start, start];
         }
-        if let Some(back) = shortest_path(graph, members, edge.to, start) {
+        if let Some(back) = graph.shortest_import_path(edge.to, start, Some(members)) {
             let mut cycle = vec![start];
             cycle.extend(back);
             if best.as_ref().is_none_or(|b| cycle.len() < b.len()) {
@@ -362,38 +468,6 @@ fn shortest_cycle(graph: &ModuleGraph, members: &HashSet<usize>, start: usize) -
         }
     }
     best.unwrap_or_else(|| vec![start])
-}
-
-/// BFS over runtime edges restricted to the component. Returns the node path
-/// from `from` to `to` inclusive.
-fn shortest_path(
-    graph: &ModuleGraph,
-    members: &HashSet<usize>,
-    from: usize,
-    to: usize,
-) -> Option<Vec<usize>> {
-    let mut previous: HashMap<usize, usize> = HashMap::new();
-    let mut queue = std::collections::VecDeque::from([from]);
-    let mut seen: HashSet<usize> = HashSet::from([from]);
-    while let Some(current) = queue.pop_front() {
-        if current == to {
-            let mut path = vec![to];
-            let mut node = to;
-            while node != from {
-                node = previous[&node];
-                path.push(node);
-            }
-            path.reverse();
-            return Some(path);
-        }
-        for edge in &graph.modules[current].edges {
-            if members.contains(&edge.to) && seen.insert(edge.to) {
-                previous.insert(edge.to, current);
-                queue.push_back(edge.to);
-            }
-        }
-    }
-    None
 }
 
 /// Ranks the edges of the representative loop for breakability. A cycle edge

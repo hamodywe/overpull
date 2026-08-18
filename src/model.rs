@@ -50,6 +50,25 @@ pub struct BindingFact {
     pub imported: ImportedName,
     pub line: u32,
     pub usage: Usage,
+    /// For a namespace binding (`import * as ns`), what its evaluation-time
+    /// references actually touch. Empty for every other binding kind.
+    pub namespace_reads: NamespaceReads,
+}
+
+/// What a namespace binding is observed to read while the module evaluates.
+///
+/// The distinction matters: an ES module namespace object exists from
+/// instantiation, so holding it is always safe. Only *reading a member* of a
+/// module that has not evaluated yet can throw, and only when that member is
+/// in the temporal dead zone. `ns.someHoistedFunction()` at the top of a
+/// cycle is legal code that an earlier version of overpull called a crash.
+#[derive(Default)]
+pub struct NamespaceReads {
+    /// Property names read off the namespace while the module evaluates.
+    pub members: Vec<String>,
+    /// The namespace object itself is passed, spread, logged, or indexed
+    /// with a computed key — that can observe every export at once.
+    pub whole_object: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]

@@ -4,9 +4,11 @@
 //! analyses stay unit-testable. See `src/main.rs` for the entry point.
 
 pub mod barrels;
+pub mod baseline;
 pub mod cli;
 pub mod cost;
 pub mod cycles;
+pub mod entries;
 pub mod graph;
 pub mod model;
 pub mod parse;
@@ -16,3 +18,4 @@ pub mod run;
 pub mod style;
 pub mod util;
 pub mod walk;
+pub mod why;
