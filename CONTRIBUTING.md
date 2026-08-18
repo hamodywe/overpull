@@ -25,16 +25,38 @@ cargo build
 cargo test
 ```
 
-Rust 1.85 or newer. No other toolchain is needed to build, though Node.js is
+Rust 1.95 or newer. No other toolchain is needed to build, though Node.js is
 needed to run the fixture verification scripts.
 
 ## Before opening a pull request
 
 ```sh
-cargo fmt              # formatting is enforced
-cargo clippy --all-targets   # must be clean, including pedantic lints
-cargo test             # all tests must pass
+sh scripts/ci.sh
 ```
+
+That is every check CI runs — formatting, pedantic clippy, tests, the MSRV
+build, the Node fixture proofs, and the release binary's exit codes — and it
+works offline on Linux, macOS, and Windows through Git Bash. Paste its
+summary line in the pull request description.
+
+To have it run automatically before each push:
+
+```sh
+sh scripts/install-hooks.sh
+```
+
+Individually, if you prefer:
+
+```sh
+cargo fmt --all --check      # formatting is enforced
+cargo clippy --all-targets   # must be clean, including pedantic lints
+cargo test --all-targets     # all tests must pass
+```
+
+Hosted CI is described in [docs/ci.md](docs/ci.md), including why the GitHub
+Actions runs are currently blocked by an account-level billing lock rather
+than by anything in this repository. `scripts/ci.sh` is the source of truth
+in the meantime.
 
 ## Fixtures
 
@@ -48,6 +70,11 @@ rule has already caught one real bug in this repository.
 Where a fixture claims a run-time behaviour, prove it:
 `tests/fixtures/crashing-cycle/verify.mjs` makes Node throw the exact error
 the report predicts, and exits non-zero if it does not.
+
+Better still, prove both sides in one fixture. `namespace-cycle` and
+`iife-cycle` each contain two cycles of the same shape with opposite
+verdicts, and their `verify.mjs` asserts that Node loads one and throws on
+the other. A one-sided fixture lets the tool pass by being uniformly wrong.
 
 There is also a fixture the tool is **required to stay silent about**
 (`tests/fixtures/clean-project`). It deliberately contains the plausible

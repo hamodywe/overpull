@@ -46,6 +46,7 @@ one line.
 | `barrels` | Which re-export files amplify, and by how much: the measured cost of importing the barrel against the measured cost of importing a member. |
 | `cycles` | Which cycles misbehave at run time, what exactly throws, and which edge to break. |
 | `check` | `barrels` + `cycles` over the whole project, for CI. |
+| `why <module>` | Why is this file in the graph at all? The shortest chain of import lines from each entry point to it. |
 
 ### What makes the cycle analysis different
 
@@ -75,10 +76,45 @@ Every crash verdict names the reading line, the binding, the declaration
 kind, and the module that had not run yet — enough to check the claim
 yourself in about thirty seconds.
 
+### Where "your entry points" comes from
+
+The difference between `crash` and `crash-if-loaded-first` is entirely a
+question of which module loads first, so overpull says out loud which modules
+it treated as program starts:
+
+| Source | Treated as |
+|---|---|
+| `package.json` — `main`, `module`, `browser`, `bin`, every leaf of `exports` | a program start |
+| Conventional source paths — `src/index.*`, `src/main.*`, `cli`, `app`, `server` at the root or under `src` | a program start |
+| Test files — `*.test.*`, `*.spec.*`, anything under `test/`, `tests/`, `__tests__/`, `e2e/` | simulated, because they produce real orders nothing else does — but findings reached only through one stay `crash-if-loaded-first`, and name the spec file |
+| Everything else nothing imports | *not* a program start; hazards through it are `crash-if-loaded-first` |
+
+A test file is deliberately not enough to claim a `crash`. Loaded on its own
+a spec file really does produce that order — but a test *process* has usually
+evaluated the safe half long before the spec runs, which is why a suite can
+be green with the shape sitting in its source. This is not hypothetical:
+`tests/fixtures/test-entry-cycle` is that exact case reduced from
+[vitejs/vite](https://github.com/vitejs/vite), with a `verify.mjs` that runs
+both orders under Node. `--fail-on hazard` gates on it; `--fail-on crash`
+does not.
+
+If the project declares nothing and has no conventional entry, every root is
+treated as a program start — with nothing to go on, `node whatever.js` is as
+plausible as any other guess.
+
+Override all of it with `--entry`:
+
+```sh
+overpull cycles --entry src/server.ts --entry src/worker.ts
+```
+
+The report prints how many entry points it simulated, and warns if the cap
+(64) left any out, rather than silently downgrading what it did not check.
+
 ## Install
 
 ```sh
-cargo install overpull
+cargo install --git https://github.com/hamodywe/overpull
 ```
 
 Or build from source:
@@ -89,7 +125,11 @@ cd overpull
 cargo build --release      # ./target/release/overpull
 ```
 
-Requires Rust 1.85 or newer. No Node.js, no `node_modules`, no config file.
+Requires Rust 1.95 or newer. No Node.js, no `node_modules`, no config file.
+
+> Not on crates.io yet, so `cargo install overpull` does not work — install
+> from git with the command above. Prebuilt binaries wait on the same thing
+> holding up CI; see [docs/ci.md](docs/ci.md).
 
 ## Quick start
 
@@ -103,8 +143,17 @@ overpull barrels
 # Which cycles are dangerous?
 overpull cycles
 
+# Why on earth is this file in my graph?
+overpull why src/legacy/config.ts
+
 # Gate a pull request
 overpull check --fail-on crash
+
+# Gate a load-cost budget the way you would a bundle size
+overpull cost src/index.ts --max-modules 200
+
+# Report only what this branch adds
+overpull check --baseline overpull-baseline.json
 ```
 
 ### `cost` — attribution per import
@@ -151,27 +200,94 @@ cycles  1 found
 That fixture is in this repository, and `node tests/fixtures/crashing-cycle/verify.mjs`
 makes Node throw the exact error the report predicts.
 
+### `why` — the route, not the count
+
+```
+why  src/internal/h07.ts
+  once loaded it pulls 1 module (83 B)
+
+  shortest chain from each entry point:
+
+    entry point src/index.ts
+      src/index.ts:7 → src/components/c07.ts
+      src/components/c07.ts:1 → src/internal/h07.ts
+
+  imported directly by 1 module
+    src/components/c07.ts:1  ../internal/h07.js
+```
+
+"Who dragged that in" is the question people actually ask when a number
+surprises them. Every hop names the import line to open.
+
+### Budgets — a gate for `cost`
+
+```sh
+overpull cost src/index.ts --max-modules 200 --max-bytes 900kb
+```
+
+```
+  over 26 modules, budget 10 — 16 over
+```
+
+Exits 1 when a budget is exceeded, the way a bundle-size budget does. A
+budget that passes still prints `within`, because a gate that goes quiet when
+it succeeds is indistinguishable from one that is not running.
+
+### Baselines — adoption on a codebase that already has findings
+
+```sh
+overpull check --json > overpull-baseline.json   # record today
+overpull check --baseline overpull-baseline.json # report only what is new
+```
+
+The first run on a large codebase is the hard part of adopting any analyser:
+two hundred findings, none of them today's problem, and the gate is off
+before lunch. A baseline judges a pull request on what it adds — while still
+reporting a finding that got *worse*, since a cycle that was benign and now
+crashes is new information about an old cycle. Suppressed counts are printed,
+so a quiet run is never mistaken for a clean one.
+
 ## CI
 
 ```yaml
 - uses: actions/checkout@v5
-- run: cargo install overpull
+- uses: dtolnay/rust-toolchain@stable
+- run: cargo install --git https://github.com/hamodywe/overpull
 - run: overpull check --fail-on crash
 ```
 
-Exit codes: `0` nothing at or above the threshold, `1` findings, `2` usage
-error.
+Exit codes: `0` nothing at or above the threshold and no budget exceeded,
+`1` findings or a budget exceeded, `2` usage error.
 
 `--json` emits the same findings as machine-readable output for a dashboard
-or a custom gate.
+or a custom gate. `--sarif` emits SARIF 2.1.0, so findings land in GitHub
+code scanning with the evidence attached:
+
+```yaml
+- run: overpull check --sarif --fail-on never > overpull.sarif
+- uses: github/codeql-action/upload-sarif@v3
+  with:
+    sarif_file: overpull.sarif
+```
+
+Benign cycles are left out of SARIF on purpose: a dashboard that shows every
+legal cycle teaches people to dismiss the whole run.
+
+**This repository's own CI** is described in [docs/ci.md](docs/ci.md) —
+including `scripts/ci.sh`, which runs every check offline on a laptop.
 
 ## Options
 
 ```
 --root <dir>              Project root (default: current directory)
+--entry <file>            Treat this file as a program entry point (repeatable)
 --tsconfig <file>         tsconfig to read `paths` from (default: auto-discover)
 --json                    Machine-readable output
+--sarif                   SARIF 2.1.0, for code-scanning dashboards
+--baseline <file>         Suppress findings already recorded in this file
 --fail-on <level>         never | crash | hazard | any
+--max-modules <n>         `cost` budget: exit 1 above this many modules
+--max-bytes <n>           `cost` budget in bytes; accepts 900kb, 2mb
 --top <n>                 Rows per section (default: 10)
 --min-amplification <n>   Barrel amplification floor (default: 4)
 --min-cost <n>            Barrel load-cost floor in modules (default: 20)
@@ -254,9 +370,16 @@ no tool.
   `import x = require()` become edges, but `module.exports` re-assignment
   patterns are not analysed. Cycles crossing them are reported as
   `cjs-mixed` rather than guessed at.
-- **Entry-order simulation is bounded.** At most 8 project entry points and 8
-  hypothetical entries per cycle are simulated. On a graph with more distinct
-  entry orders than that, a hazard could in principle hide behind the ninth.
+- **Entry-order simulation is bounded.** At most 64 real entry points and 8
+  hypothetical entries per cycle are simulated. When the cap bites, the report
+  says so and names the number left out — narrow the set with `--entry`.
+- **Async IIFEs are treated as deferred.** `(() => { … })()` is correctly
+  recognised as running at module-evaluation time, but
+  `(async () => { … })()` is not: only the part before the first `await` runs
+  synchronously, and overpull does not report what it cannot prove.
+- **Whole-namespace reads are pessimistic.** `ns.member` is judged by that
+  member's declaration, but `{...ns}` or `console.log(ns)` can observe every
+  export at once, so every export becomes a candidate.
 - **Re-export chains are followed 64 levels deep.** Past that the search
   stops, because source is untrusted input and an unbounded chain is a stack
   hazard, not a codebase.
@@ -289,6 +412,12 @@ tools built on it are stranded until 7.1.
 No, and it does not need a build. Resolution degrades gracefully: an
 unresolved bare specifier is still counted as an external package, and
 unresolved relative imports are reported.
+
+**Why does `check` show fewer findings than I expected?**
+If you passed `--baseline`, the run prints how many findings it hid and says
+"no *new* import cycles" rather than "clean". If you did not, check the
+`simulated from N entry points` line — the verdicts are only as good as the
+entry set, and `--entry` overrides it.
 
 **Why is my cycle `crash-if-loaded-first` when I know it crashes?**
 Because from your project's entry points, the module that declares the
